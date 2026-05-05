@@ -1,0 +1,23 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "compilerPath": "/home/Creeken/miniconda3/envs/pytorch/bin/gcc",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/opt/cuda/include"
+            ],
+            "defines": [
+                "__CUDACC__",
+                "__NVCC__",
+                "__global__=",
+                "__device__=",
+                "__host__="
+            ],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}

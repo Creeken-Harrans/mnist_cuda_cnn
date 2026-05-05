@@ -1,0 +1,19 @@
+# compiled binary
+build/
+
+# downloaded MNIST dataset
+data/
+
+# run outputs & figures
+runs/
+result.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# editor
+*.swp
+*.swo
+*~
+.DS_Store

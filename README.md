@@ -964,3 +964,323 @@ bash scripts/download_mnist.sh
 ```
 
 这三个改动最适合继续理解完整机器学习工程链路。
+
+---
+
+## 22. Matplotlib 可视化输出：训练曲线、预测样本、第一层卷积核
+
+这一节是后续追加内容，原 README 上面的说明没有删除。当前版本在保持 CUDA 训练主体尽量少改的前提下，新增了一个 Python/Matplotlib 可视化脚本：
+
+```text
+scripts/visualize_results.py
+```
+
+CUDA 主程序训练结束后，会默认把少量可视化所需数据导出到：
+
+```text
+runs/latest/
+├── metrics.csv
+├── prediction_samples.csv
+└── conv1_weights.csv
+```
+
+然后 Python 脚本会把这些 CSV 画成图片：
+
+```text
+runs/latest/figures/
+├── training_curves.png
+├── prediction_grid.png
+├── conv1_filters.png
+└── confidence_histogram.png
+```
+
+### 22.1 先回答一个重要问题：权重现在是怎样保存的？
+
+原始版本里，模型权重并没有被保存成磁盘上的 checkpoint 文件。
+
+训练时的参数都保存在 GPU 显存中的 `DeviceBuffer<float>` 里。模型结构大致是：
+
+```cpp
+struct CNN {
+    Param2D conv1;
+    Param2D conv2;
+    Param2D fc1;
+    Param2D fc2;
+    Activations act;
+};
+```
+
+其中每个 `Param2D` 里面有：
+
+```cpp
+DeviceBuffer<float> w;   // weight 参数
+DeviceBuffer<float> b;   // bias 参数
+DeviceBuffer<float> gw;  // weight gradient
+DeviceBuffer<float> gb;  // bias gradient
+DeviceBuffer<float> mw;  // Adam 一阶动量
+DeviceBuffer<float> vw;  // Adam 二阶动量
+DeviceBuffer<float> mb;
+DeviceBuffer<float> vb;
+```
+
+也就是说，真正的权重在：
+
+```text
+conv1.w, conv1.b
+conv2.w, conv2.b
+fc1.w,   fc1.b
+fc2.w,   fc2.b
+```
+
+这些都是 `DeviceBuffer<float>`，也就是 CUDA device memory。它们在程序运行期间存在，程序结束后会通过 RAII 析构释放；原始版本不会把完整模型保存到 `.bin`、`.pt`、`.ckpt` 或 `.npz`。
+
+本次修改为了可视化第一层卷积核，额外导出了：
+
+```text
+runs/latest/conv1_weights.csv
+```
+
+注意：这个文件只保存 `conv1.w`，用于画第一层卷积核，不是完整模型 checkpoint。如果以后想实现真正的模型保存/恢复，应该再单独保存：
+
+```text
+conv1.w, conv1.b
+conv2.w, conv2.b
+fc1.w, fc1.b
+fc2.w, fc2.b
+```
+
+并且最好保存成二进制格式，而不是 CSV。
+
+### 22.2 需要安装的 Python 依赖
+
+如果你已经有 Python 环境，直接安装：
+
+```bash
+pip install matplotlib numpy
+```
+
+项目里也新增了：
+
+```text
+requirements.txt
+```
+
+所以也可以运行：
+
+```bash
+pip install -r requirements.txt
+```
+
+### 22.3 训练并导出可视化数据
+
+正常训练：
+
+```bash
+make
+./build/mnist_cuda_cnn --epochs 8 --batch 128 --lr 0.001
+```
+
+训练结束后会看到类似输出：
+
+```text
+[export] metrics will be written to runs/latest/metrics.csv
+...
+[export] wrote runs/latest/prediction_samples.csv
+[export] wrote runs/latest/conv1_weights.csv
+[export] run: python scripts/visualize_results.py --run-dir runs/latest
+```
+
+也可以指定输出目录：
+
+```bash
+./build/mnist_cuda_cnn --epochs 8 --batch 128 --out runs/exp01
+```
+
+这样 CSV 会写到：
+
+```text
+runs/exp01/
+```
+
+### 22.4 生成 Matplotlib 图片
+
+默认读取 `runs/latest`：
+
+```bash
+python scripts/visualize_results.py --run-dir runs/latest
+```
+
+或者使用 Makefile target：
+
+```bash
+make visualize
+```
+
+如果你训练时使用了自定义输出目录：
+
+```bash
+python scripts/visualize_results.py --run-dir runs/exp01
+```
+
+### 22.5 每张图是什么意思？
+
+#### training_curves.png
+
+显示训练过程中的：
+
+```text
+train loss
+train accuracy
+test accuracy
+```
+
+它回答的问题是：
+
+```text
+模型有没有真的在学习？
+训练 loss 是否下降？
+训练准确率和测试准确率是否同步提高？
+是否出现明显 overfitting？
+```
+
+#### prediction_grid.png
+
+显示一组测试集图片，以及模型预测结果：
+
+```text
+y=<真实标签> pred=<预测标签> conf=<softmax 置信度>
+```
+
+标题颜色含义：
+
+```text
+绿色：预测正确
+红色：预测错误
+```
+
+这张图可以帮助你直观看到模型到底在分类哪些数字，而不是只看一个最终准确率。
+
+#### conv1_filters.png
+
+显示第一层卷积核 `conv1.w` 的 8 个 5×5 filter。
+
+第一层卷积核通常会学到一些局部边缘、笔画、方向性响应。这个项目的第一层是：
+
+```text
+Conv(1 -> 8, kernel=5x5, padding=2)
+```
+
+所以一共有 8 个 filter，每个 filter 是 5×5。
+
+#### confidence_histogram.png
+
+显示导出的测试样本里，模型 softmax confidence 的分布。
+
+它回答的问题是：
+
+```text
+模型预测正确时通常有多自信？
+模型预测错误时是否也过度自信？
+```
+
+### 22.6 新增的命令行参数
+
+本次 CUDA 主程序只做了很小的接口扩展：
+
+```bash
+--out DIR
+```
+
+指定 CSV 输出目录，默认：
+
+```text
+runs/latest
+```
+
+例如：
+
+```bash
+./build/mnist_cuda_cnn --out runs/exp01
+```
+
+另外新增：
+
+```bash
+--viz-samples N
+```
+
+指定导出多少个测试样本给 Python 画图，默认：
+
+```text
+64
+```
+
+例如：
+
+```bash
+./build/mnist_cuda_cnn --viz-samples 100
+```
+
+如果你只想看训练曲线和卷积核，不想导出预测样本，也可以：
+
+```bash
+./build/mnist_cuda_cnn --viz-samples 0
+```
+
+不过这时 `prediction_grid.png` 和 `confidence_histogram.png` 无法生成。
+
+### 22.7 这次 CUDA/C++ 具体最小改了什么？
+
+核心 CUDA kernel 没有改：
+
+```text
+conv2d_forward_kernel
+conv2d_backward_input_kernel
+conv2d_backward_weight_kernel
+maxpool2x2_forward_kernel
+maxpool2x2_backward_kernel
+fc_forward_kernel
+fc_backward_weight_kernel
+softmax_xent_backward_kernel
+adam_update_kernel
+```
+
+也就是说，训练数学逻辑和 GPU kernel 主体没有变。
+
+只是在 host-side C++ 增加了几个导出函数：
+
+```cpp
+softmax_host(...)
+export_prediction_samples(...)
+export_conv1_weights(...)
+```
+
+以及训练循环中每个 epoch 追加写入：
+
+```text
+metrics.csv
+```
+
+这些改动的目的只是把训练过程和最终预测结果保存成 Python 容易读取的 CSV。
+
+### 22.8 一套完整运行流程
+
+从零开始：
+
+```bash
+make
+./build/mnist_cuda_cnn --epochs 8 --batch 128 --lr 0.001
+pip install -r requirements.txt
+python scripts/visualize_results.py --run-dir runs/latest
+```
+
+然后打开：
+
+```text
+runs/latest/figures/training_curves.png
+runs/latest/figures/prediction_grid.png
+runs/latest/figures/conv1_filters.png
+runs/latest/figures/confidence_histogram.png
+```
+
+如果你在 VS Code 里，可以直接在 Explorer 里点开这些 PNG。

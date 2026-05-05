@@ -884,6 +884,91 @@ static float evaluate(CNN& net, const MnistData& test, BatchDevice& batch, int b
     return float(total_correct) / float(total_seen);
 }
 
+static std::vector<float> softmax_host(const float* logits, int C) {
+    std::vector<float> prob(C);
+    float maxv = logits[0];
+    for (int i = 1; i < C; ++i) maxv = std::max(maxv, logits[i]);
+    float sum = 0.0f;
+    for (int i = 0; i < C; ++i) {
+        prob[i] = std::exp(logits[i] - maxv);
+        sum += prob[i];
+    }
+    for (int i = 0; i < C; ++i) prob[i] /= sum;
+    return prob;
+}
+
+static void export_prediction_samples(
+    CNN& net,
+    const MnistData& test,
+    BatchDevice& batch,
+    int batch_size,
+    const std::string& out_dir,
+    int sample_count) {
+
+    sample_count = std::max(0, std::min(sample_count, test.n));
+    if (sample_count == 0) return;
+
+    std::filesystem::create_directories(out_dir);
+    const std::string path = out_dir + "/prediction_samples.csv";
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Cannot write prediction sample file: " + path);
+
+    out << "index,label,pred,confidence";
+    for (int c = 0; c < 10; ++c) out << ",p" << c;
+    for (int i = 0; i < 28 * 28; ++i) out << ",pixel" << i;
+    out << "\n";
+
+    std::vector<int> order(test.n);
+    std::iota(order.begin(), order.end(), 0);
+    std::vector<float> host_logits(size_t(batch_size) * 10);
+
+    for (int start = 0; start < sample_count; start += batch_size) {
+        int B = std::min(batch_size, sample_count - start);
+        copy_batch(test, order, start, B, batch);
+        forward(net, batch.x.p, B);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        net.act.logits.copy_to_host(host_logits.data(), size_t(B) * 10);
+
+        for (int i = 0; i < B; ++i) {
+            int idx = start + i;
+            std::vector<float> prob = softmax_host(host_logits.data() + size_t(i) * 10, 10);
+            int pred = int(std::max_element(prob.begin(), prob.end()) - prob.begin());
+            float conf = prob[pred];
+            int label = test.labels[idx];
+
+            out << idx << "," << label << "," << pred << "," << std::setprecision(8) << conf;
+            for (int c = 0; c < 10; ++c) out << "," << std::setprecision(8) << prob[c];
+            const float* image = test.images.data() + size_t(idx) * 28 * 28;
+            for (int j = 0; j < 28 * 28; ++j) out << "," << std::setprecision(8) << image[j];
+            out << "\n";
+        }
+    }
+
+    std::cout << "[export] wrote " << path << "\n";
+}
+
+static void export_conv1_weights(const CNN& net, const std::string& out_dir) {
+    std::filesystem::create_directories(out_dir);
+    const std::string path = out_dir + "/conv1_weights.csv";
+    std::ofstream out(path);
+    if (!out) throw std::runtime_error("Cannot write conv1 weight file: " + path);
+
+    std::vector<float> hw(size_t(net.conv1.rows) * net.conv1.cols);
+    net.conv1.w.copy_to_host(hw.data(), hw.size());
+
+    out << "filter,kh,kw,weight\n";
+    for (int oc = 0; oc < net.conv1.rows; ++oc) {
+        for (int kh = 0; kh < 5; ++kh) {
+            for (int kw = 0; kw < 5; ++kw) {
+                int idx = oc * 25 + kh * 5 + kw;
+                out << oc << "," << kh << "," << kw << "," << std::setprecision(9) << hw[idx] << "\n";
+            }
+        }
+    }
+
+    std::cout << "[export] wrote " << path << "\n";
+}
+
 struct Options {
     std::string data_dir = "data/MNIST/raw";
     int epochs = 8;
@@ -892,6 +977,8 @@ struct Options {
     float weight_decay = 1e-4f;
     unsigned seed = 42;
     bool progress = true;
+    std::string out_dir = "runs/latest";
+    int viz_samples = 64;
 };
 
 static Options parse_args(int argc, char** argv) {
@@ -908,10 +995,13 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--lr") opt.lr = std::stof(need_value(a));
         else if (a == "--weight-decay") opt.weight_decay = std::stof(need_value(a));
         else if (a == "--seed") opt.seed = unsigned(std::stoul(need_value(a)));
+        else if (a == "--out") opt.out_dir = need_value(a);
+        else if (a == "--viz-samples") opt.viz_samples = std::stoi(need_value(a));
         else if (a == "--no-progress") opt.progress = false;
         else if (a == "--help" || a == "-h") {
             std::cout << "Usage: ./mnist_cuda_cnn [--epochs 8] [--batch 128] [--lr 0.001] "
-                         "[--weight-decay 0.0001] [--data data/MNIST/raw] [--seed 42] [--no-progress]\n";
+                         "[--weight-decay 0.0001] [--data data/MNIST/raw] [--seed 42] "
+                         "[--out runs/latest] [--viz-samples 64] [--no-progress]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + a);
@@ -922,6 +1012,7 @@ static Options parse_args(int argc, char** argv) {
     if (opt.batch_size > 512) throw std::runtime_error("batch size >512 is not recommended for this simple implementation");
     if (opt.lr <= 0.0f) throw std::runtime_error("learning rate must be positive");
     if (opt.weight_decay < 0.0f) throw std::runtime_error("weight decay must be non-negative");
+    if (opt.viz_samples < 0) throw std::runtime_error("viz sample count must be non-negative");
     return opt;
 }
 
@@ -963,6 +1054,13 @@ int main(int argc, char** argv) {
                      "Conv(8->16,5,pad2)-ReLU-MaxPool-FC(784->64)-ReLU-FC(64->10)\n";
         std::cout << "[train] epochs=" << opt.epochs << " batch=" << opt.batch_size
                   << " lr=" << opt.lr << " weight_decay=" << opt.weight_decay << "\n";
+
+        std::filesystem::create_directories(opt.out_dir);
+        const std::string metrics_path = opt.out_dir + "/metrics.csv";
+        std::ofstream metrics(metrics_path);
+        if (!metrics) throw std::runtime_error("Cannot write metrics file: " + metrics_path);
+        metrics << "epoch,train_loss,train_acc,test_acc,lr,elapsed_sec\n";
+        std::cout << "[export] metrics will be written to " << metrics_path << "\n";
 
         const int total_batches = ceil_div(train.n, opt.batch_size);
 
@@ -1012,6 +1110,16 @@ int main(int argc, char** argv) {
                       << " train_acc=" << std::setprecision(2) << train_acc * 100.0f << "%"
                       << " test_acc=" << std::setprecision(2) << test_acc * 100.0f << "%"
                       << " lr=" << std::scientific << std::setprecision(1) << lr_epoch << std::fixed << "\n";
+
+            auto now_epoch = std::chrono::high_resolution_clock::now();
+            double elapsed_epoch = std::chrono::duration<double>(now_epoch - t0).count();
+            metrics << epoch << ","
+                    << std::setprecision(8) << train_loss << ","
+                    << std::setprecision(8) << train_acc << ","
+                    << std::setprecision(8) << test_acc << ","
+                    << std::setprecision(8) << lr_epoch << ","
+                    << std::setprecision(8) << elapsed_epoch << "\n";
+            metrics.flush();
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -1021,6 +1129,10 @@ int main(int argc, char** argv) {
                   << " elapsed_sec=" << std::setprecision(2) << sec << "\n";
         std::cout << "[note] This is a from-scratch educational CUDA implementation. It should be correct, "
                      "but it is intentionally not cuDNN-level fast.\n";
+
+        export_prediction_samples(net, test, batch, opt.batch_size, opt.out_dir, opt.viz_samples);
+        export_conv1_weights(net, opt.out_dir);
+        std::cout << "[export] run: python scripts/visualize_results.py --run-dir " << opt.out_dir << "\n";
 
         return 0;
     } catch (const std::exception& e) {

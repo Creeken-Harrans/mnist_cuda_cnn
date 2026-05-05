@@ -18,13 +18,22 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, TypedDict
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
 DIGITS = list(range(10))
+
+
+class Sample(TypedDict):
+    index: int
+    label: int
+    pred: int
+    confidence: float
+    probs: np.ndarray
+    image: np.ndarray
 
 
 def setup_style() -> None:
@@ -70,25 +79,25 @@ def read_metrics(path: Path) -> Dict[str, np.ndarray]:
     }
 
 
-def read_prediction_samples(path: Path) -> List[Dict[str, object]]:
+def read_prediction_samples(path: Path) -> List[Sample]:
     if not path.exists():
         raise FileNotFoundError(f"Missing prediction sample file: {path}")
 
-    samples: List[Dict[str, object]] = []
+    samples: List[Sample] = []
     with path.open() as f:
         reader = csv.DictReader(f)
         for row in reader:
             probs = np.array([float(row[f"p{i}"]) for i in DIGITS], dtype=np.float32)
             pixels = np.array([float(row[f"pixel{i}"]) for i in range(28 * 28)], dtype=np.float32).reshape(28, 28)
             samples.append(
-                {
-                    "index": int(row["index"]),
-                    "label": int(row["label"]),
-                    "pred": int(row["pred"]),
-                    "confidence": float(row["confidence"]),
-                    "probs": probs,
-                    "image": pixels,
-                }
+                Sample(
+                    index=int(row["index"]),
+                    label=int(row["label"]),
+                    pred=int(row["pred"]),
+                    confidence=float(row["confidence"]),
+                    probs=probs,
+                    image=pixels,
+                )
             )
     if not samples:
         raise ValueError(f"Prediction sample file is empty: {path}")
@@ -133,8 +142,7 @@ def plot_training_curves(metrics: Dict[str, np.ndarray], out_path: Path) -> None
     ax_acc.set_ylim(max(0, min(train_acc.min(), test_acc.min()) - 5), 100)
 
     lines = loss_line + train_line + test_line
-    labels = [line.get_label() for line in lines]
-    ax_loss.legend(lines, labels, loc="center right")
+    ax_loss.legend(lines, ["train loss", "train acc", "test acc"], loc="center right")
 
     final_test = test_acc[-1]
     ax_loss.text(
@@ -150,7 +158,7 @@ def plot_training_curves(metrics: Dict[str, np.ndarray], out_path: Path) -> None
     plt.close(fig)
 
 
-def plot_prediction_grid(samples: Sequence[Dict[str, object]], out_path: Path, max_images: int = 36) -> None:
+def plot_prediction_grid(samples: Sequence[Sample], out_path: Path, max_images: int = 36) -> None:
     shown = list(samples[:max_images])
     cols = 6
     rows = int(np.ceil(len(shown) / cols))
@@ -162,9 +170,9 @@ def plot_prediction_grid(samples: Sequence[Dict[str, object]], out_path: Path, m
 
     for ax, sample in zip(axes.flat, shown):
         image = sample["image"]
-        label = int(sample["label"])
-        pred = int(sample["pred"])
-        conf = float(sample["confidence"])
+        label = sample["label"]
+        pred = sample["pred"]
+        conf = sample["confidence"]
         correct = pred == label
 
         ax.imshow(image, cmap="gray_r", vmin=0.0, vmax=1.0)
@@ -203,12 +211,12 @@ def plot_conv1_filters(weights: np.ndarray, out_path: Path) -> None:
     plt.close(fig)
 
 
-def plot_confidence_histogram(samples: Sequence[Dict[str, object]], out_path: Path) -> None:
-    correct_conf = [float(s["confidence"]) for s in samples if int(s["label"]) == int(s["pred"])]
-    wrong_conf = [float(s["confidence"]) for s in samples if int(s["label"]) != int(s["pred"])]
+def plot_confidence_histogram(samples: Sequence[Sample], out_path: Path) -> None:
+    correct_conf = [s["confidence"] for s in samples if s["label"] == s["pred"]]
+    wrong_conf = [s["confidence"] for s in samples if s["label"] != s["pred"]]
 
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
-    bins = np.linspace(0.0, 1.0, 21)
+    bins = np.linspace(0.0, 1.0, 21).tolist()
     if correct_conf:
         ax.hist(correct_conf, bins=bins, alpha=0.75, label="correct")
     if wrong_conf:

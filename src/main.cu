@@ -1,7 +1,11 @@
-// mnist_cuda_cnn/src/main.cu
-// A compact from-scratch C++/CUDA MNIST CNN trainer.
-// No PyTorch, no libtorch, no cuDNN. CUDA kernels implement convolution, pooling,
-// fully-connected layers, ReLU, softmax cross entropy, and Adam updates.
+// mnist_cuda_cnn_v2/src/main.cu
+// A compact, from-scratch C++/CUDA MNIST CNN trainer.
+//
+// Design goals:
+//   - No PyTorch, no libtorch, no cuDNN.
+//   - Keep the project small enough to study.
+//   - Still use safer C++ RAII, explicit CUDA error checks, and clean training logs.
+//   - Show a tqdm-like progress bar during training.
 
 #include <cuda_runtime.h>
 
@@ -13,12 +17,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #define CUDA_CHECK(call)                                                          \
@@ -32,7 +38,11 @@
         }                                                                        \
     } while (0)
 
-static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
+#define CUDA_LAUNCH_CHECK() CUDA_CHECK(cudaGetLastError())
+
+static inline int ceil_div(int a, int b) {
+    return (a + b - 1) / b;
+}
 
 static std::string shell_quote(const std::string& s) {
     std::string out = "'";
@@ -58,6 +68,9 @@ static void run_cmd(const std::string& cmd) {
 
 static void ensure_mnist_downloaded(const std::string& raw_dir) {
     std::filesystem::create_directories(raw_dir);
+
+    // fgnt/mnist is a convenient mirror of the original MNIST IDX gzip files.
+    // Keeping this as plain curl + gzip avoids adding a C++ HTTP dependency.
     const std::string base = "https://raw.githubusercontent.com/fgnt/mnist/master";
     const std::vector<std::string> files = {
         "train-images-idx3-ubyte.gz",
@@ -120,8 +133,8 @@ static MnistData load_mnist_split(const std::string& image_path, const std::stri
 
     std::vector<uint8_t> pixels(size_t(data.n) * 28 * 28);
     std::vector<uint8_t> labels(data.n);
-    img.read(reinterpret_cast<char*>(pixels.data()), pixels.size());
-    lab.read(reinterpret_cast<char*>(labels.data()), labels.size());
+    img.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
+    lab.read(reinterpret_cast<char*>(labels.data()), static_cast<std::streamsize>(labels.size()));
     if (!img || !lab) throw std::runtime_error("Unexpected EOF while reading MNIST payload");
 
     for (size_t i = 0; i < pixels.size(); ++i) {
@@ -143,27 +156,129 @@ struct DeviceBuffer {
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
-    ~DeviceBuffer() { release(); }
-
-    void alloc(size_t count) {
-        release();
-        n = count;
-        if (n > 0) CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)));
+    DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), n(other.n) {
+        other.p = nullptr;
+        other.n = 0;
     }
-    void release() {
+
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) {
+            release_noexcept();
+            p = other.p;
+            n = other.n;
+            other.p = nullptr;
+            other.n = 0;
+        }
+        return *this;
+    }
+
+    ~DeviceBuffer() noexcept {
+        release_noexcept();
+    }
+
+    void release_noexcept() noexcept {
+        if (p) {
+            cudaFree(p); // Never throw from a destructor path.
+        }
+        p = nullptr;
+        n = 0;
+    }
+
+    void release_checked() {
         if (p) CUDA_CHECK(cudaFree(p));
         p = nullptr;
         n = 0;
     }
-    void zero() { CUDA_CHECK(cudaMemset(p, 0, n * sizeof(T))); }
+
+    void alloc(size_t count) {
+        release_checked();
+        n = count;
+        if (n > 0) {
+            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)));
+        }
+    }
+
+    void zero() {
+        if (n > 0) CUDA_CHECK(cudaMemset(p, 0, n * sizeof(T)));
+    }
+
     void copy_from_host(const T* src, size_t count) {
         if (count > n) throw std::runtime_error("copy_from_host count exceeds buffer size");
-        CUDA_CHECK(cudaMemcpy(p, src, count * sizeof(T), cudaMemcpyHostToDevice));
+        if (count > 0) CUDA_CHECK(cudaMemcpy(p, src, count * sizeof(T), cudaMemcpyHostToDevice));
     }
+
     void copy_to_host(T* dst, size_t count) const {
         if (count > n) throw std::runtime_error("copy_to_host count exceeds buffer size");
-        CUDA_CHECK(cudaMemcpy(dst, p, count * sizeof(T), cudaMemcpyDeviceToHost));
+        if (count > 0) CUDA_CHECK(cudaMemcpy(dst, p, count * sizeof(T), cudaMemcpyDeviceToHost));
     }
+};
+
+static std::string format_duration(double seconds) {
+    if (seconds < 0.0 || !std::isfinite(seconds)) seconds = 0.0;
+    int s = static_cast<int>(seconds + 0.5);
+    int h = s / 3600;
+    s %= 3600;
+    int m = s / 60;
+    s %= 60;
+    std::ostringstream oss;
+    if (h > 0) {
+        oss << h << ":" << std::setw(2) << std::setfill('0') << m << ":" << std::setw(2) << s;
+    } else {
+        oss << m << ":" << std::setw(2) << std::setfill('0') << s;
+    }
+    return oss.str();
+}
+
+class ProgressBar {
+public:
+    ProgressBar(std::string prefix, int total, bool enabled)
+        : prefix_(std::move(prefix)), total_(std::max(total, 1)), enabled_(enabled), start_(Clock::now()), last_print_(start_) {}
+
+    void update(int current, float avg_loss, float avg_acc, float lr, bool force = false) {
+        if (!enabled_) return;
+        current = std::clamp(current, 0, total_);
+        auto now = Clock::now();
+        double since_last = std::chrono::duration<double>(now - last_print_).count();
+        if (!force && current < total_ && since_last < 0.10) return;
+        last_print_ = now;
+
+        double elapsed = std::chrono::duration<double>(now - start_).count();
+        double ratio = double(current) / double(total_);
+        int filled = static_cast<int>(ratio * width_);
+        double speed = elapsed > 1e-9 ? double(current) / elapsed : 0.0;
+        double eta = speed > 1e-9 ? double(total_ - current) / speed : 0.0;
+
+        std::ostringstream bar;
+        bar << "\r" << prefix_ << " [";
+        for (int i = 0; i < width_; ++i) {
+            if (i < filled) bar << "=";
+            else if (i == filled && current < total_) bar << ">";
+            else bar << ".";
+        }
+        bar << "] "
+            << std::setw(4) << current << "/" << std::left << std::setw(4) << total_ << std::right
+            << " " << std::fixed << std::setprecision(1) << (100.0 * ratio) << "%"
+            << " | loss " << std::setprecision(4) << avg_loss
+            << " | acc " << std::setprecision(2) << (100.0f * avg_acc) << "%"
+            << " | lr " << std::scientific << std::setprecision(1) << lr << std::fixed
+            << " | " << format_duration(elapsed) << "<" << format_duration(eta)
+            << "        ";
+        std::cout << bar.str() << std::flush;
+    }
+
+    void finish(float avg_loss, float avg_acc, float lr) {
+        update(total_, avg_loss, avg_acc, lr, true);
+        if (enabled_) std::cout << "\n";
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    std::string prefix_;
+    int total_ = 1;
+    bool enabled_ = true;
+    int width_ = 32;
+    Clock::time_point start_;
+    Clock::time_point last_print_;
 };
 
 // ---------------- CUDA kernels: layer forward/backward ----------------
@@ -347,7 +462,8 @@ __global__ void maxpool2x2_backward_kernel(
 
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < total_out) {
-        dx[mask[i]] = dy[i]; // no overlap for non-overlapping 2x2 pooling windows
+        // Non-overlapping 2x2 pooling: each input location belongs to at most one output window.
+        dx[mask[i]] = dy[i];
     }
 }
 
@@ -541,7 +657,7 @@ struct Activations {
 };
 
 struct CNN {
-    // conv weights are stored as Param2D.w flattened: rows=OC, cols=IC*KH*KW.
+    // Conv weights are stored as Param2D.w flattened: rows=OC, cols=IC*KH*KW.
     Param2D conv1; // 1 -> 8, 5x5, pad 2
     Param2D conv2; // 8 -> 16, 5x5, pad 2
     Param2D fc1;   // 16*7*7 -> 64
@@ -584,87 +700,107 @@ static void init_model(CNN& net, unsigned seed) {
 
 static void launch_relu_forward(const DeviceBuffer<float>& x, DeviceBuffer<float>& y, int total) {
     relu_forward_kernel<<<ceil_div(total, 256), 256>>>(x.p, y.p, total);
+    CUDA_LAUNCH_CHECK();
 }
 
 static void launch_relu_backward(const DeviceBuffer<float>& y, const DeviceBuffer<float>& dy, DeviceBuffer<float>& dx, int total) {
     relu_backward_kernel<<<ceil_div(total, 256), 256>>>(y.p, dy.p, dx.p, total);
+    CUDA_LAUNCH_CHECK();
 }
 
 static void forward(CNN& net, const float* x_dev, int B) {
-    // x: B x 1 x 28 x 28
     conv2d_forward_kernel<<<ceil_div(B * 8 * 28 * 28, 256), 256>>>(
         x_dev, net.conv1.w.p, net.conv1.b.p, net.act.z1.p,
         B, 1, 28, 28, 8, 5, 5, 2, 28, 28);
+    CUDA_LAUNCH_CHECK();
     launch_relu_forward(net.act.z1, net.act.a1, B * 8 * 28 * 28);
     maxpool2x2_forward_kernel<<<ceil_div(B * 8 * 14 * 14, 256), 256>>>(
         net.act.a1.p, net.act.p1.p, net.act.m1.p, B, 8, 28, 28);
+    CUDA_LAUNCH_CHECK();
 
     conv2d_forward_kernel<<<ceil_div(B * 16 * 14 * 14, 256), 256>>>(
         net.act.p1.p, net.conv2.w.p, net.conv2.b.p, net.act.z2.p,
         B, 8, 14, 14, 16, 5, 5, 2, 14, 14);
+    CUDA_LAUNCH_CHECK();
     launch_relu_forward(net.act.z2, net.act.a2, B * 16 * 14 * 14);
     maxpool2x2_forward_kernel<<<ceil_div(B * 16 * 7 * 7, 256), 256>>>(
         net.act.a2.p, net.act.p2.p, net.act.m2.p, B, 16, 14, 14);
+    CUDA_LAUNCH_CHECK();
 
     fc_forward_kernel<<<ceil_div(B * 64, 256), 256>>>(
         net.act.p2.p, net.fc1.w.p, net.fc1.b.p, net.act.z3.p,
         B, 16 * 7 * 7, 64);
+    CUDA_LAUNCH_CHECK();
     launch_relu_forward(net.act.z3, net.act.a3, B * 64);
     fc_forward_kernel<<<ceil_div(B * 10, 256), 256>>>(
         net.act.a3.p, net.fc2.w.p, net.fc2.b.p, net.act.logits.p,
         B, 64, 10);
+    CUDA_LAUNCH_CHECK();
 }
 
 static void backward(CNN& net, const float* x_dev, const int* y_dev, int B) {
-    // loss_dev and correct_dev are filled by softmax_xent_backward_kernel.
     net.loss_dev.zero();
     net.correct_dev.zero();
     softmax_xent_backward_kernel<<<ceil_div(B, 128), 128>>>(
         net.act.logits.p, y_dev, net.act.dlogits.p, net.loss_dev.p, net.correct_dev.p, B, 10);
+    CUDA_LAUNCH_CHECK();
 
     // fc2 backward
     fc_backward_input_kernel<<<ceil_div(B * 64, 256), 256>>>(
         net.act.dlogits.p, net.fc2.w.p, net.act.da3.p, B, 64, 10);
+    CUDA_LAUNCH_CHECK();
     fc_backward_weight_kernel<<<ceil_div(10 * 64, 256), 256>>>(
         net.act.a3.p, net.act.dlogits.p, net.fc2.gw.p, B, 64, 10);
+    CUDA_LAUNCH_CHECK();
     fc_backward_bias_kernel<<<ceil_div(10, 256), 256>>>(
         net.act.dlogits.p, net.fc2.gb.p, B, 10);
+    CUDA_LAUNCH_CHECK();
 
     // ReLU after fc1, then fc1 backward
     launch_relu_backward(net.act.a3, net.act.da3, net.act.dz3, B * 64);
     fc_backward_input_kernel<<<ceil_div(B * 16 * 7 * 7, 256), 256>>>(
         net.act.dz3.p, net.fc1.w.p, net.act.dp2.p, B, 16 * 7 * 7, 64);
+    CUDA_LAUNCH_CHECK();
     fc_backward_weight_kernel<<<ceil_div(64 * 16 * 7 * 7, 256), 256>>>(
         net.act.p2.p, net.act.dz3.p, net.fc1.gw.p, B, 16 * 7 * 7, 64);
+    CUDA_LAUNCH_CHECK();
     fc_backward_bias_kernel<<<ceil_div(64, 256), 256>>>(
         net.act.dz3.p, net.fc1.gb.p, B, 64);
+    CUDA_LAUNCH_CHECK();
 
     // pool2 backward -> relu2 backward -> conv2 backward
     CUDA_CHECK(cudaMemset(net.act.da2.p, 0, size_t(B) * 16 * 14 * 14 * sizeof(float)));
     maxpool2x2_backward_kernel<<<ceil_div(B * 16 * 7 * 7, 256), 256>>>(
         net.act.dp2.p, net.act.m2.p, net.act.da2.p, B * 16 * 7 * 7);
+    CUDA_LAUNCH_CHECK();
     launch_relu_backward(net.act.a2, net.act.da2, net.act.dz2, B * 16 * 14 * 14);
 
     conv2d_backward_input_kernel<<<ceil_div(B * 8 * 14 * 14, 256), 256>>>(
         net.act.dz2.p, net.conv2.w.p, net.act.dp1.p,
         B, 8, 14, 14, 16, 5, 5, 2, 14, 14);
+    CUDA_LAUNCH_CHECK();
     conv2d_backward_weight_kernel<<<ceil_div(16 * 8 * 5 * 5, 256), 256>>>(
         net.act.p1.p, net.act.dz2.p, net.conv2.gw.p,
         B, 8, 14, 14, 16, 5, 5, 2, 14, 14);
+    CUDA_LAUNCH_CHECK();
     conv2d_backward_bias_kernel<<<ceil_div(16, 256), 256>>>(
         net.act.dz2.p, net.conv2.gb.p, B, 16, 14, 14);
+    CUDA_LAUNCH_CHECK();
 
     // pool1 backward -> relu1 backward -> conv1 weight/bias backward
     CUDA_CHECK(cudaMemset(net.act.da1.p, 0, size_t(B) * 8 * 28 * 28 * sizeof(float)));
     maxpool2x2_backward_kernel<<<ceil_div(B * 8 * 14 * 14, 256), 256>>>(
         net.act.dp1.p, net.act.m1.p, net.act.da1.p, B * 8 * 14 * 14);
+    CUDA_LAUNCH_CHECK();
     launch_relu_backward(net.act.a1, net.act.da1, net.act.dz1, B * 8 * 28 * 28);
 
     conv2d_backward_weight_kernel<<<ceil_div(8 * 1 * 5 * 5, 256), 256>>>(
         x_dev, net.act.dz1.p, net.conv1.gw.p,
         B, 1, 28, 28, 8, 5, 5, 2, 28, 28);
+    CUDA_LAUNCH_CHECK();
     conv2d_backward_bias_kernel<<<ceil_div(8, 256), 256>>>(
         net.act.dz1.p, net.conv1.gb.p, B, 8, 28, 28);
+    CUDA_LAUNCH_CHECK();
 }
 
 static void adam_update_param(Param2D& p, float lr, int step, float weight_decay) {
@@ -677,8 +813,10 @@ static void adam_update_param(Param2D& p, float lr, int step, float weight_decay
     int nw = p.rows * p.cols;
     adam_update_kernel<<<ceil_div(nw, 256), 256>>>(
         p.w.p, p.gw.p, p.mw.p, p.vw.p, nw, lr, beta1, beta2, eps, b1t, b2t, weight_decay);
+    CUDA_LAUNCH_CHECK();
     adam_update_kernel<<<ceil_div(p.rows, 256), 256>>>(
         p.b.p, p.gb.p, p.mb.p, p.vb.p, p.rows, lr, beta1, beta2, eps, b1t, b2t, 0.0f);
+    CUDA_LAUNCH_CHECK();
 }
 
 static void adam_update(CNN& net, float lr, int step, float weight_decay) {
@@ -714,12 +852,12 @@ static void copy_batch(const MnistData& data, const std::vector<int>& order, int
     batch.y.copy_from_host(batch.hy.data(), B);
 }
 
-static std::pair<float, float> read_loss_acc(CNN& net, int B) {
+static std::pair<float, int> read_loss_correct(CNN& net) {
     float loss = 0.0f;
     int correct = 0;
     net.loss_dev.copy_to_host(&loss, 1);
     net.correct_dev.copy_to_host(&correct, 1);
-    return {loss, float(correct) / float(B)};
+    return {loss, correct};
 }
 
 static float evaluate(CNN& net, const MnistData& test, BatchDevice& batch, int batch_size) {
@@ -736,6 +874,7 @@ static float evaluate(CNN& net, const MnistData& test, BatchDevice& batch, int b
         net.correct_dev.zero();
         softmax_xent_backward_kernel<<<ceil_div(B, 128), 128>>>(
             net.act.logits.p, batch.y.p, net.act.dlogits.p, net.loss_dev.p, net.correct_dev.p, B, 10);
+        CUDA_LAUNCH_CHECK();
         CUDA_CHECK(cudaDeviceSynchronize());
         int correct = 0;
         net.correct_dev.copy_to_host(&correct, 1);
@@ -752,6 +891,7 @@ struct Options {
     float lr = 1e-3f;
     float weight_decay = 1e-4f;
     unsigned seed = 42;
+    bool progress = true;
 };
 
 static Options parse_args(int argc, char** argv) {
@@ -768,16 +908,20 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--lr") opt.lr = std::stof(need_value(a));
         else if (a == "--weight-decay") opt.weight_decay = std::stof(need_value(a));
         else if (a == "--seed") opt.seed = unsigned(std::stoul(need_value(a)));
+        else if (a == "--no-progress") opt.progress = false;
         else if (a == "--help" || a == "-h") {
             std::cout << "Usage: ./mnist_cuda_cnn [--epochs 8] [--batch 128] [--lr 0.001] "
-                         "[--weight-decay 0.0001] [--data data/MNIST/raw] [--seed 42]\n";
+                         "[--weight-decay 0.0001] [--data data/MNIST/raw] [--seed 42] [--no-progress]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("Unknown argument: " + a);
         }
     }
+    if (opt.epochs <= 0) throw std::runtime_error("epochs must be positive");
     if (opt.batch_size <= 0) throw std::runtime_error("batch size must be positive");
     if (opt.batch_size > 512) throw std::runtime_error("batch size >512 is not recommended for this simple implementation");
+    if (opt.lr <= 0.0f) throw std::runtime_error("learning rate must be positive");
+    if (opt.weight_decay < 0.0f) throw std::runtime_error("weight decay must be non-negative");
     return opt;
 }
 
@@ -820,17 +964,21 @@ int main(int argc, char** argv) {
         std::cout << "[train] epochs=" << opt.epochs << " batch=" << opt.batch_size
                   << " lr=" << opt.lr << " weight_decay=" << opt.weight_decay << "\n";
 
+        const int total_batches = ceil_div(train.n, opt.batch_size);
+
         for (int epoch = 1; epoch <= opt.epochs; ++epoch) {
             std::shuffle(order.begin(), order.end(), rng);
-            float epoch_loss_sum = 0.0f;
+            double epoch_loss_sum = 0.0;
             int epoch_correct = 0;
             int epoch_seen = 0;
             int batch_count = 0;
 
-            // gentle LR decay improves final accuracy while keeping defaults simple
+            // Gentle LR decay improves final accuracy while keeping defaults simple.
             float lr_epoch = opt.lr;
             if (epoch > opt.epochs * 2 / 3) lr_epoch *= 0.25f;
             else if (epoch > opt.epochs / 2) lr_epoch *= 0.5f;
+
+            ProgressBar bar("epoch " + std::to_string(epoch) + "/" + std::to_string(opt.epochs), total_batches, opt.progress);
 
             for (int start = 0; start < train.n; start += opt.batch_size) {
                 int B = std::min(opt.batch_size, train.n - start);
@@ -841,33 +989,38 @@ int main(int argc, char** argv) {
                 adam_update(net, lr_epoch, step, opt.weight_decay);
                 CUDA_CHECK(cudaDeviceSynchronize());
 
-                auto [loss, acc] = read_loss_acc(net, B);
-                epoch_loss_sum += loss;
-                epoch_correct += int(std::round(acc * B));
+                auto [loss, correct] = read_loss_correct(net);
+                epoch_loss_sum += double(loss) * double(B);
+                epoch_correct += correct;
                 epoch_seen += B;
                 ++batch_count;
 
-                if (batch_count % 100 == 0) {
-                    std::cout << "  epoch " << epoch << " batch " << batch_count
-                              << " loss=" << loss << " acc=" << acc * 100.0f << "%\n";
-                }
+                float avg_loss = float(epoch_loss_sum / double(epoch_seen));
+                float avg_acc = float(epoch_correct) / float(epoch_seen);
+                bar.update(batch_count, avg_loss, avg_acc, lr_epoch);
             }
 
-            float train_loss = epoch_loss_sum / float(batch_count);
+            float train_loss = float(epoch_loss_sum / double(epoch_seen));
             float train_acc = float(epoch_correct) / float(epoch_seen);
+            bar.finish(train_loss, train_acc, lr_epoch);
+
+            std::cout << "[eval] running test set..." << std::flush;
             float test_acc = evaluate(net, test, batch, opt.batch_size);
-            std::cout << "[epoch " << epoch << "] train_loss=" << train_loss
-                      << " train_acc=" << train_acc * 100.0f << "%"
-                      << " test_acc=" << test_acc * 100.0f << "%"
-                      << " lr=" << lr_epoch << "\n";
+            std::cout << " done\n";
+
+            std::cout << "[epoch " << epoch << "] train_loss=" << std::fixed << std::setprecision(4) << train_loss
+                      << " train_acc=" << std::setprecision(2) << train_acc * 100.0f << "%"
+                      << " test_acc=" << std::setprecision(2) << test_acc * 100.0f << "%"
+                      << " lr=" << std::scientific << std::setprecision(1) << lr_epoch << std::fixed << "\n";
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double sec = std::chrono::duration<double>(t1 - t0).count();
         float final_acc = evaluate(net, test, batch, opt.batch_size);
-        std::cout << "[done] final_test_acc=" << final_acc * 100.0f << "%"
-                  << " elapsed_sec=" << sec << "\n";
-        std::cout << "[note] On a normal CUDA GPU, the default 8 epochs should usually reach about 98%+ on MNIST.\n";
+        std::cout << "[done] final_test_acc=" << std::fixed << std::setprecision(2) << final_acc * 100.0f << "%"
+                  << " elapsed_sec=" << std::setprecision(2) << sec << "\n";
+        std::cout << "[note] This is a from-scratch educational CUDA implementation. It should be correct, "
+                     "but it is intentionally not cuDNN-level fast.\n";
 
         return 0;
     } catch (const std::exception& e) {

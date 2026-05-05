@@ -33,9 +33,6 @@
     } while (0)
 
 static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
-static inline int idx4(int n, int c, int h, int w, int C, int H, int W) {
-    return ((n * C + c) * H + h) * W + w;
-}
 
 static std::string shell_quote(const std::string& s) {
     std::string out = "'";
